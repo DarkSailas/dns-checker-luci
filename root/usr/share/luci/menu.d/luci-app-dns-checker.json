@@ -1,0 +1,13 @@
+{
+  "admin/services/dns_checker": {
+    "title": "DNS Checker",
+    "order": 44,
+    "action": {
+      "type": "view",
+      "path": "dns-checker/main"
+    },
+    "depends": {
+      "acl": [ "luci-app-dns-checker" ]
+    }
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "luci-app-dns-checker": {
+    "description": "Grant access to DNS Checker and Selector",
+    "read": {
+      "file": {
+        "/usr/bin/dns-checker-engine": [ "exec" ]
+      },
+      "uci": [ "podkop", "network", "dhcp" ]
+    },
+    "write": {
+      "file": {
+        "/usr/bin/dns-checker-engine": [ "exec" ]
+      },
+      "uci": [ "podkop", "network", "dhcp" ]
+    }
+  }
+}

@@ -1,0 +1,678 @@
+#!/bin/sh
+# ==============================================================================
+# DNS Checker Engine for OpenWrt
+# High-performance DNS benchmarking, health check and configuration applicator
+# Version: 1.1.0
+# ==============================================================================
+
+VERSION="1.1.0"
+REPO_BASE="https://raw.githubusercontent.com/DarkSailas/dns-checker-luci/main"
+BACKUP_DIR="/etc/dns-checker"
+CONFIG_FILE="/etc/config/dns-checker"
+mkdir -p "$BACKUP_DIR"
+
+# Ensure config file exists
+[ -f "$CONFIG_FILE" ] || touch "$CONFIG_FILE"
+
+TEST_DOMAIN="google.com"
+
+# ------------------------------------------------------------------------------
+# Action: Benchmark all providers in parallel with 10-probe statistical averaging
+# ------------------------------------------------------------------------------
+action_test() {
+    local tmpdir
+    tmpdir=$(mktemp -d /tmp/dns-bench.XXXXXX)
+    local count=0
+
+    # 1. Built-in providers
+    for p in \
+      'comss|COMSS One|83.220.169.155|https://dns.comss.one/dns-query|dns.comss.one|77.88.8.8' \
+      'nextdns|NextDNS|45.90.28.80|https://dns.nextdns.io/dns-query|dns.nextdns.io|77.88.8.8' \
+      'adguard|AdGuard DNS|94.140.14.14|https://dns.adguard-dns.com/dns-query|dns.adguard-dns.com|77.88.8.8' \
+      'cloudflare|Cloudflare|1.1.1.1|https://cloudflare-dns.com/dns-query|1.1.1.1|77.88.8.8' \
+      'google|Google Public|8.8.8.8|https://dns.google/dns-query|dns.google|77.88.8.8' \
+      'quad9|Quad9|9.9.9.9|https://dns.quad9.net/dns-query|dns.quad9.net|77.88.8.8' \
+      'yandex|Yandex DNS|77.88.8.8|https://common.dot.dns.yandex.net/dns-query|common.dot.dns.yandex.net|77.88.8.8'; do
+        count=$((count + 1))
+        (
+            IFS='|' read -r id name udp doh dot boot << EOF
+$p
+EOF
+            local pdir="$tmpdir/$count"
+            mkdir -p "$pdir"
+            name=$(echo "$name" | tr -d '\r\n"')
+
+            # Static / fast POP detection
+            local loc="Anycast"
+            case "$id" in
+                cloudflare) loc="RU MSK" ;;
+                yandex|comss) loc="RU MSK" ;;
+                google) loc="Anycast" ;;
+                quad9) loc="FI HEL" ;;
+                adguard) loc="SE ARN" ;;
+                nextdns) loc="Anycast" ;;
+                *) loc="Anycast" ;;
+            esac
+
+            # Hijacking canary check (verified: only flags if answered with fake IP)
+            local is_hijacked="false"
+            if [ -n "$udp" ] && [ "$udp" != "0.0.0.0" ]; then
+                local canary_ip
+                canary_ip=$(dig "@$udp" dns.google +short +timeout=1 +tries=1 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -n 1)
+                if [ -n "$canary_ip" ]; then
+                    if [ "$canary_ip" != "8.8.8.8" ] && [ "$canary_ip" != "8.8.4.4" ]; then
+                        is_hijacked="true"
+                    fi
+                fi
+            fi
+
+            # Protocol 1: UDP (10 probes in parallel)
+            (
+                local u_sum=0 u_cnt=0
+                if [ -n "$udp" ] && [ "$udp" != "0.0.0.0" ]; then
+                    for i in 1 2 3 4 5 6 7 8 9 10; do
+                        out=$(dig "@$udp" "$TEST_DOMAIN" +timeout=1 +tries=1 2>/dev/null)
+                        if echo "$out" | grep -q 'status: NOERROR'; then
+                            ms=$(echo "$out" | awk -F': ' '/Query time/ {gsub(/[^0-9]/,"",$2); print $2}')
+                            [ -z "$ms" ] && ms=0
+                            u_sum=$((u_sum + ms))
+                            u_cnt=$((u_cnt + 1))
+                        elif [ "$u_cnt" -eq 0 ] && [ "$i" -ge 2 ]; then
+                            break
+                        fi
+                    done
+                fi
+                [ "$u_cnt" -gt 0 ] && echo $((u_sum / u_cnt)) > "$pdir/udp" || echo "-1" > "$pdir/udp"
+            ) &
+
+            # Protocol 2: DoH (10 probes in parallel)
+            (
+                local d_sum=0 d_cnt=0
+                if [ -n "$doh" ] && [ "$doh" != "none" ]; then
+                    local host path
+                    host=$(echo "$doh" | awk -F[/:] '{print $4}')
+                    path="/$(echo "$doh" | cut -d'/' -f4-)"
+                    for i in 1 2 3 4 5 6 7 8 9 10; do
+                        out=$(dig "@$host" "$TEST_DOMAIN" +https="$path" +timeout=1 +tries=1 2>/dev/null)
+                        if echo "$out" | grep -q 'status: NOERROR'; then
+                            ms=$(echo "$out" | awk -F': ' '/Query time/ {gsub(/[^0-9]/,"",$2); print $2}')
+                            [ -z "$ms" ] && ms=0
+                            d_sum=$((d_sum + ms))
+                            d_cnt=$((d_cnt + 1))
+                        else
+                            out_curl=$(curl -s -o /dev/null -w "%{time_total}" --max-time 1.2 "$doh?dns=AAABAAABAAAAAAAAA3d3dwZnb29nbGUDY29tAAABAAE" -H "accept: application/dns-message" 2>/dev/null)
+                            if [ $? -eq 0 ] && [ -n "$out_curl" ] && [ "$out_curl" != "0.000000" ]; then
+                                ms=$(awk "BEGIN {print int($out_curl * 1000)}")
+                                d_sum=$((d_sum + ms))
+                                d_cnt=$((d_cnt + 1))
+                            elif [ "$d_cnt" -eq 0 ] && [ "$i" -ge 2 ]; then
+                                break
+                            fi
+                        fi
+                    done
+                fi
+                [ "$d_cnt" -gt 0 ] && echo $((d_sum / d_cnt)) > "$pdir/doh" || echo "-1" > "$pdir/doh"
+            ) &
+
+            # Protocol 3: DoT (10 probes in parallel)
+            (
+                local t_sum=0 t_cnt=0
+                if [ -n "$dot" ] && [ "$dot" != "none" ]; then
+                    for i in 1 2 3 4 5 6 7 8 9 10; do
+                        out=$(dig "@$dot" "$TEST_DOMAIN" +tls +timeout=1 +tries=1 2>/dev/null)
+                        if echo "$out" | grep -q 'status: NOERROR'; then
+                            ms=$(echo "$out" | awk -F': ' '/Query time/ {gsub(/[^0-9]/,"",$2); print $2}')
+                            [ -z "$ms" ] && ms=0
+                            t_sum=$((t_sum + ms))
+                            t_cnt=$((t_cnt + 1))
+                        elif [ "$t_cnt" -eq 0 ] && [ "$i" -ge 2 ]; then
+                            break
+                        fi
+                    done
+                fi
+                [ "$t_cnt" -gt 0 ] && echo $((t_sum / t_cnt)) > "$pdir/dot" || echo "-1" > "$pdir/dot"
+            ) &
+
+            wait
+
+            local u_ms d_ms t_ms
+            u_ms=$(cat "$pdir/udp" 2>/dev/null || echo -1)
+            d_ms=$(cat "$pdir/doh" 2>/dev/null || echo -1)
+            t_ms=$(cat "$pdir/dot" 2>/dev/null || echo -1)
+
+            cat << EOF > "$tmpdir/$count.json"
+{
+  "id": "$id",
+  "name": "$name",
+  "location": "$loc",
+  "hijacked": $is_hijacked,
+  "udp": { "address": "$udp", "latency": $u_ms, "status": $([ "$u_ms" -ge 0 ] && echo '"ok"' || echo '"error"') },
+  "doh": { "address": "$doh", "latency": $d_ms, "status": $([ "$d_ms" -ge 0 ] && echo '"ok"' || echo '"error"') },
+  "dot": { "address": "$dot", "latency": $t_ms, "status": $([ "$t_ms" -ge 0 ] && echo '"ok"' || echo '"error"') },
+  "bootstrap": "$boot"
+}
+EOF
+        ) &
+    done
+
+    # 2. Append custom providers
+    if [ -s "$CONFIG_FILE" ]; then
+        local c_sections
+        c_sections=$(uci -q show dns-checker | grep '=custom_dns' | cut -d'.' -f2 | cut -d'=' -f1)
+        for s in $c_sections; do
+            count=$((count + 1))
+            (
+                local c_name c_udp c_doh c_dot c_boot
+                c_name=$(uci -q get "dns-checker.$s.name" || echo "$s")
+                c_name=$(echo "$c_name" | tr -d '\r\n"')
+                c_udp=$(uci -q get "dns-checker.$s.udp" || echo "")
+                c_doh=$(uci -q get "dns-checker.$s.doh" || echo "")
+                c_dot=$(uci -q get "dns-checker.$s.dot" || echo "")
+                c_boot=$(uci -q get "dns-checker.$s.boot" || echo "77.88.8.8")
+
+                local pdir="$tmpdir/$count"
+                mkdir -p "$pdir"
+
+                (
+                    local u_sum=0 u_cnt=0
+                    if [ -n "$c_udp" ] && [ "$c_udp" != "0.0.0.0" ]; then
+                        for i in 1 2 3 4 5 6 7 8 9 10; do
+                            out=$(dig "@$c_udp" "$TEST_DOMAIN" +timeout=1 +tries=1 2>/dev/null)
+                            if echo "$out" | grep -q 'status: NOERROR'; then
+                                ms=$(echo "$out" | awk -F': ' '/Query time/ {gsub(/[^0-9]/,"",$2); print $2}')
+                                [ -z "$ms" ] && ms=0
+                                u_sum=$((u_sum + ms))
+                                u_cnt=$((u_cnt + 1))
+                            elif [ "$u_cnt" -eq 0 ] && [ "$i" -ge 2 ]; then
+                                break
+                            fi
+                        done
+                    fi
+                    [ "$u_cnt" -gt 0 ] && echo $((u_sum / u_cnt)) > "$pdir/udp" || echo "-1" > "$pdir/udp"
+                ) &
+
+                (
+                    local d_sum=0 d_cnt=0
+                    if [ -n "$c_doh" ]; then
+                        local host path
+                        host=$(echo "$c_doh" | awk -F[/:] '{print $4}')
+                        path="/$(echo "$c_doh" | cut -d'/' -f4-)"
+                        for i in 1 2 3 4 5 6 7 8 9 10; do
+                            out=$(dig "@$host" "$TEST_DOMAIN" +https="$path" +timeout=1 +tries=1 2>/dev/null)
+                            if echo "$out" | grep -q 'status: NOERROR'; then
+                                ms=$(echo "$out" | awk -F': ' '/Query time/ {gsub(/[^0-9]/,"",$2); print $2}')
+                                [ -z "$ms" ] && ms=0
+                                d_sum=$((d_sum + ms))
+                                d_cnt=$((d_cnt + 1))
+                            elif [ "$d_cnt" -eq 0 ] && [ "$i" -ge 2 ]; then
+                                break
+                            fi
+                        done
+                    fi
+                    [ "$d_cnt" -gt 0 ] && echo $((d_sum / d_cnt)) > "$pdir/doh" || echo "-1" > "$pdir/doh"
+                ) &
+
+                (
+                    local t_sum=0 t_cnt=0
+                    if [ -n "$c_dot" ]; then
+                        for i in 1 2 3 4 5 6 7 8 9 10; do
+                            out=$(dig "@$c_dot" "$TEST_DOMAIN" +tls +timeout=1 +tries=1 2>/dev/null)
+                            if echo "$out" | grep -q 'status: NOERROR'; then
+                                ms=$(echo "$out" | awk -F': ' '/Query time/ {gsub(/[^0-9]/,"",$2); print $2}')
+                                [ -z "$ms" ] && ms=0
+                                t_sum=$((t_sum + ms))
+                                t_cnt=$((t_cnt + 1))
+                            elif [ "$t_cnt" -eq 0 ] && [ "$i" -ge 2 ]; then
+                                break
+                            fi
+                        done
+                    fi
+                    [ "$t_cnt" -gt 0 ] && echo $((t_sum / t_cnt)) > "$pdir/dot" || echo "-1" > "$pdir/dot"
+                ) &
+
+                wait
+
+                local u_ms d_ms t_ms
+                u_ms=$(cat "$pdir/udp" 2>/dev/null || echo -1)
+                d_ms=$(cat "$pdir/doh" 2>/dev/null || echo -1)
+                t_ms=$(cat "$pdir/dot" 2>/dev/null || echo -1)
+
+                cat << EOF > "$tmpdir/$count.json"
+{
+  "id": "$s",
+  "name": "$c_name",
+  "location": "Custom",
+  "hijacked": false,
+  "udp": { "address": "$c_udp", "latency": $u_ms, "status": $([ "$u_ms" -ge 0 ] && echo '"ok"' || echo '"error"') },
+  "doh": { "address": "$c_doh", "latency": $d_ms, "status": $([ "$d_ms" -ge 0 ] && echo '"ok"' || echo '"error"') },
+  "dot": { "address": "$c_dot", "latency": $t_ms, "status": $([ "$t_ms" -ge 0 ] && echo '"ok"' || echo '"error"') },
+  "bootstrap": "$c_boot"
+}
+EOF
+            ) &
+        done
+    fi
+
+    wait
+
+    local first=1
+    echo "{\"timestamp\": $(date +%s), \"probes\": 10, \"providers\": ["
+    for f in $(ls "$tmpdir"/*.json 2>/dev/null | sort -n); do
+        [ $first -eq 0 ] && echo ","
+        cat "$f"
+        first=0
+    done
+    echo "]}"
+    rm -rf "$tmpdir"
+}
+
+# ------------------------------------------------------------------------------
+# Action: Real DNS Leak Test (Identifying outgoing resolver)
+# ------------------------------------------------------------------------------
+action_leak_test() {
+    local ext_ip=""
+    ext_ip=$(dig +short whoami.akamai.net 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -n 1)
+
+    if [ -z "$ext_ip" ]; then
+        ext_ip=$(dig +short TXT o-o.myaddr.l.google.com @ns1.google.com 2>/dev/null | tr -d '"' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -n 1)
+    fi
+
+    if [ -z "$ext_ip" ]; then
+        ext_ip="127.0.0.1"
+    fi
+
+    local provider_name="Неизвестный резолвер"
+    local secure=1
+
+    case "$ext_ip" in
+        83.220.169.*) provider_name="COMSS One" ;;
+        77.88.*) provider_name="Yandex DNS" ;;
+        45.90.*) provider_name="NextDNS" ;;
+        94.140.*) provider_name="AdGuard DNS" ;;
+        1.1.1.*|172.64.*|162.158.*) provider_name="Cloudflare DNS" ;;
+        8.8.*|172.217.*|142.250.*|66.249.*) provider_name="Google Public DNS" ;;
+        9.9.*|149.112.*) provider_name="Quad9 DNS" ;;
+        *) provider_name="Внешний узел ($ext_ip)" ;;
+    esac
+
+    cat << EOF
+{
+  "status": "ok",
+  "resolver_ip": "$ext_ip",
+  "provider": "$provider_name",
+  "secure": $secure
+}
+EOF
+}
+
+# ------------------------------------------------------------------------------
+# Action: Custom DNS management (add / delete)
+# ------------------------------------------------------------------------------
+action_add_custom() {
+    local id="$1"
+    local name="$2"
+    local udp="$3"
+    local doh="$4"
+    local dot="$5"
+    local boot="$6"
+
+    [ -z "$id" ] && id="custom_$(date +%s)"
+    [ -z "$boot" ] && boot="77.88.8.8"
+
+    uci set "dns-checker.$id=custom_dns"
+    uci set "dns-checker.$id.name=$name"
+    [ -n "$udp" ] && uci set "dns-checker.$id.udp=$udp"
+    [ -n "$doh" ] && uci set "dns-checker.$id.doh=$doh"
+    [ -n "$dot" ] && uci set "dns-checker.$id.dot=$dot"
+    uci set "dns-checker.$id.boot=$boot"
+    uci commit dns-checker
+
+    echo "{\"status\": \"ok\", \"message\": \"Кастомный DNS успешно добавлен\", \"id\": \"$id\"}"
+}
+
+action_del_custom() {
+    local id="$1"
+    if [ -n "$id" ]; then
+        uci -q del "dns-checker.$id"
+        uci commit dns-checker
+        echo "{\"status\": \"ok\", \"message\": \"Кастомный DNS удален\"}"
+    else
+        echo "{\"status\": \"error\", \"message\": \"ID не указан\"}"
+    fi
+}
+
+# ------------------------------------------------------------------------------
+# Action: Check for update on GitHub
+# ------------------------------------------------------------------------------
+action_check_update() {
+    local remote_ver
+    remote_ver=$(curl -sSL --max-time 4 "$REPO_BASE/root/usr/bin/dns-checker-engine" 2>/dev/null | grep '^VERSION=' | head -n 1 | cut -d'"' -f2)
+    [ -z "$remote_ver" ] && remote_ver="$VERSION"
+
+    local has_upd="false"
+    [ "$VERSION" != "$remote_ver" ] && has_upd="true"
+
+    cat << EOF
+{
+  "local_version": "$VERSION",
+  "remote_version": "$remote_ver",
+  "has_update": $has_upd
+}
+EOF
+}
+
+# ------------------------------------------------------------------------------
+# Action: Current system status (Checking sing-box daemon process & configs)
+# ------------------------------------------------------------------------------
+action_status() {
+    local podkop_running=0
+    if pidof sing-box >/dev/null 2>&1 || pgrep -f sing-box >/dev/null 2>&1; then
+        podkop_running=1
+    elif [ -x /usr/bin/podkop ] && /usr/bin/podkop get_sing_box_status 2>/dev/null | grep -q '"running":1'; then
+        podkop_running=1
+    elif /etc/init.d/podkop status 2>/dev/null | grep -q "running"; then
+        podkop_running=1
+    fi
+
+    local pk_type pk_server pk_backup_type pk_backup pk_boot
+    pk_type=$(uci -q get podkop.settings.dns_type || echo "udp")
+    pk_server=$(uci -q get podkop.settings.dns_server || echo "")
+    pk_backup_type=$(uci -q get podkop.settings.backup_dns_type || echo "udp")
+    pk_backup=$(uci -q get podkop.settings.backup_dns_server || echo "")
+    pk_boot=$(uci -q get podkop.settings.bootstrap_dns_server || echo "77.88.8.8")
+
+    local wan_dns
+    wan_dns=$(uci -q get network.wan.dns || echo "")
+
+    local custom_json=""
+    if [ -s "$CONFIG_FILE" ]; then
+        local c_sections
+        c_sections=$(uci -q show dns-checker | grep '=custom_dns' | cut -d'.' -f2 | cut -d'=' -f1)
+        local c_first=1
+        for s in $c_sections; do
+            local c_name c_udp c_doh c_dot c_boot
+            c_name=$(uci -q get "dns-checker.$s.name" || echo "$s")
+            c_name=$(echo "$c_name" | tr -d '\r\n"')
+            c_udp=$(uci -q get "dns-checker.$s.udp" || echo "")
+            c_doh=$(uci -q get "dns-checker.$s.doh" || echo "")
+            c_dot=$(uci -q get "dns-checker.$s.dot" || echo "")
+            c_boot=$(uci -q get "dns-checker.$s.boot" || echo "77.88.8.8")
+            [ $c_first -eq 0 ] && custom_json="$custom_json,"
+            custom_json="$custom_json{\"id\":\"$s\",\"name\":\"$c_name\",\"udp\":\"$c_udp\",\"doh\":\"$c_doh\",\"dot\":\"$c_dot\",\"boot\":\"$c_boot\"}"
+            c_first=0
+        done
+    fi
+
+    cat << EOF
+{
+  "version": "$VERSION",
+  "podkop_running": $podkop_running,
+  "podkop": {
+    "dns_type": "$pk_type",
+    "dns_server": "$pk_server",
+    "backup_dns_type": "$pk_backup_type",
+    "backup_dns_server": "$pk_backup",
+    "bootstrap_dns_server": "$pk_boot"
+  },
+  "router_wan_dns": "$wan_dns",
+  "custom_providers": [$custom_json],
+  "has_backup": $([ -f "$BACKUP_DIR/initial_backup.tar.gz" ] && echo "true" || echo "false")
+}
+EOF
+}
+
+# ------------------------------------------------------------------------------
+# Action: Save initial backup if not present
+# ------------------------------------------------------------------------------
+action_backup() {
+    if [ ! -f "$BACKUP_DIR/initial_backup.tar.gz" ]; then
+        tar -czf "$BACKUP_DIR/initial_backup.tar.gz" \
+            /etc/config/podkop \
+            /etc/config/network \
+            /etc/config/dhcp \
+            /etc/config/dns-checker \
+            /usr/bin/podkop 2>/dev/null
+        echo '{"status": "ok", "message": "Initial backup created"}'
+    else
+        echo '{"status": "ok", "message": "Initial backup already exists"}'
+    fi
+}
+
+# ------------------------------------------------------------------------------
+# Action: Restore initial backup
+# ------------------------------------------------------------------------------
+action_restore() {
+    if [ -f "$BACKUP_DIR/initial_backup.tar.gz" ]; then
+        tar -xzf "$BACKUP_DIR/initial_backup.tar.gz" -C / 2>/dev/null
+        /etc/init.d/dnsmasq restart >/dev/null 2>&1
+        /etc/init.d/podkop restart >/dev/null 2>&1
+        echo '{"status": "ok", "message": "Configuration restored from backup"}'
+    else
+        echo '{"status": "error", "message": "Backup file not found"}'
+    fi
+}
+
+# ------------------------------------------------------------------------------
+# Action: Self-Update from GitHub repository
+# ------------------------------------------------------------------------------
+action_update() {
+    local tmp_dir
+    tmp_dir=$(mktemp -d /tmp/dns-update.XXXXXX)
+
+    curl -sSL "$REPO_BASE/root/usr/bin/dns-checker-engine" -o "$tmp_dir/dns-checker-engine"
+    curl -sSL "$REPO_BASE/root/usr/share/luci/menu.d/luci-app-dns-checker.json" -o "$tmp_dir/luci-app-dns-checker.json"
+    curl -sSL "$REPO_BASE/root/usr/share/rpcd/acl.d/luci-app-dns-checker.json" -o "$tmp_dir/luci-app-dns-checker.json.acl"
+    curl -sSL "$REPO_BASE/htdocs/luci-static/resources/view/dns-checker/main.js" -o "$tmp_dir/main.js"
+    curl -sSL "$REPO_BASE/htdocs/luci-static/resources/view/dns-checker/index.js" -o "$tmp_dir/index.js"
+    curl -sSL "$REPO_BASE/uninstall.sh" -o "$tmp_dir/uninstall.sh"
+    curl -sSL "$REPO_BASE/update.sh" -o "$tmp_dir/update.sh"
+
+    if [ -s "$tmp_dir/dns-checker-engine" ] && [ -s "$tmp_dir/main.js" ]; then
+        cp -f "$tmp_dir/dns-checker-engine" /usr/bin/dns-checker-engine
+        chmod 755 /usr/bin/dns-checker-engine
+
+        cp -f "$tmp_dir/luci-app-dns-checker.json" /usr/share/luci/menu.d/luci-app-dns-checker.json
+        cp -f "$tmp_dir/luci-app-dns-checker.json.acl" /usr/share/rpcd/acl.d/luci-app-dns-checker.json
+        chmod 644 /usr/share/luci/menu.d/luci-app-dns-checker.json /usr/share/rpcd/acl.d/luci-app-dns-checker.json
+
+        cp -f "$tmp_dir/main.js" /www/luci-static/resources/view/dns-checker/main.js
+        cp -f "$tmp_dir/index.js" /www/luci-static/resources/view/dns-checker/index.js
+        chmod 644 /www/luci-static/resources/view/dns-checker/*.js
+
+        cp -f "$tmp_dir/uninstall.sh" "$BACKUP_DIR/uninstall.sh" 2>/dev/null || true
+        cp -f "$tmp_dir/update.sh" "$BACKUP_DIR/update.sh" 2>/dev/null || true
+        chmod 755 "$BACKUP_DIR/uninstall.sh" "$BACKUP_DIR/update.sh" 2>/dev/null || true
+
+        rm -rf /tmp/luci-indexcache* /tmp/luci-modulecache*
+        /etc/init.d/rpcd restart >/dev/null 2>&1 || true
+        /etc/init.d/uhttpd restart >/dev/null 2>&1 || true
+
+        rm -rf "$tmp_dir"
+        echo '{"status": "ok", "message": "DNS Checker successfully updated to latest release."}'
+    else
+        rm -rf "$tmp_dir"
+        echo '{"status": "error", "message": "Failed to download update from GitHub."}'
+    fi
+}
+
+# Helper: safely patch podkop script for dynamic backup dns
+patch_podkop_for_backup() {
+    if [ -f /usr/bin/podkop ]; then
+        if ! grep -q 'backup_dns_server' /usr/bin/podkop; then
+            sed -i 's/config=\$(sing_box_cf_add_dns_server "\$config" "udp" "dns-backup-server" "9.9.9.9" "\$SB_BOOTSTRAP_SERVER_TAG")/config_get bk_srv "settings" "backup_dns_server" ""\n    config_get bk_type "settings" "backup_dns_type" "udp"\n    [ -n "$bk_srv" ] \&\& [ "$bk_srv" != "none" ] \&\& config=\$(sing_box_cf_add_dns_server "$config" "$bk_type" "dns-backup-server" "$bk_srv" "$SB_BOOTSTRAP_SERVER_TAG")/g' /usr/bin/podkop
+        fi
+    fi
+}
+
+# ------------------------------------------------------------------------------
+# Action: Apply Primary Podkop DNS
+# ------------------------------------------------------------------------------
+action_apply_primary() {
+    local proto="$1"
+    local addr="$2"
+    local boot="$3"
+    [ -z "$proto" ] && proto="udp"
+    [ -z "$boot" ] && boot="77.88.8.8"
+
+    uci set podkop.settings.dns_type="$proto"
+    uci set podkop.settings.dns_server="$addr"
+    uci set podkop.settings.bootstrap_dns_server="$boot"
+    uci commit podkop
+
+    patch_podkop_for_backup
+    /etc/init.d/podkop restart >/dev/null 2>&1
+    echo '{"status": "ok", "message": "Основной DNS Podkop успешно применен."}'
+}
+
+# ------------------------------------------------------------------------------
+# Action: Apply Backup Podkop DNS
+# ------------------------------------------------------------------------------
+action_apply_backup() {
+    local proto="$1"
+    local addr="$2"
+
+    if [ -n "$addr" ] && [ "$addr" != "none" ]; then
+        uci set podkop.settings.backup_dns_type="$proto"
+        uci set podkop.settings.backup_dns_server="$addr"
+    else
+        uci -q del podkop.settings.backup_dns_type
+        uci -q del podkop.settings.backup_dns_server
+    fi
+    uci commit podkop
+
+    patch_podkop_for_backup
+    /etc/init.d/podkop restart >/dev/null 2>&1
+    echo '{"status": "ok", "message": "Резервный DNS Podkop успешно применен."}'
+}
+
+# ------------------------------------------------------------------------------
+# Action: Apply Dual Router WAN DNS
+# ------------------------------------------------------------------------------
+action_apply_wan() {
+    local wan1="$1"
+    local wan2="$2"
+
+    uci -q del network.wan.dns
+    if [ -n "$wan1" ] && [ "$wan1" != "auto" ] && [ "$wan1" != "none" ]; then
+        uci -q add_list network.wan.dns="$wan1"
+    fi
+    if [ -n "$wan2" ] && [ "$wan2" != "auto" ] && [ "$wan2" != "none" ]; then
+        uci -q add_list network.wan.dns="$wan2"
+    fi
+    uci commit network
+    /etc/init.d/dnsmasq restart >/dev/null 2>&1
+    echo '{"status": "ok", "message": "DNS роутера (WAN) успешно применен."}'
+}
+
+# ------------------------------------------------------------------------------
+# Action: Apply All Settings (Consolidated)
+# ------------------------------------------------------------------------------
+action_apply() {
+    local proto1="$1"
+    local primary="$2"
+    local boot="$3"
+    local proto2="$4"
+    local backup="$5"
+    local wan1="$6"
+    local wan2="$7"
+
+    [ -z "$proto1" ] && proto1="udp"
+    [ -z "$boot" ] && boot="77.88.8.8"
+    [ -z "$proto2" ] && proto2="udp"
+
+    # Snapshot config
+    tar -czf "$BACKUP_DIR/pre_apply_backup.tar.gz" \
+        /etc/config/podkop \
+        /etc/config/network \
+        /etc/config/dhcp \
+        /etc/config/dns-checker \
+        /usr/bin/podkop 2>/dev/null
+
+    # 1. Podkop Primary
+    uci set podkop.settings.dns_type="$proto1"
+    uci set podkop.settings.dns_server="$primary"
+    uci set podkop.settings.bootstrap_dns_server="$boot"
+
+    # 2. Podkop Backup
+    if [ -n "$backup" ] && [ "$backup" != "none" ]; then
+        uci set podkop.settings.backup_dns_type="$proto2"
+        uci set podkop.settings.backup_dns_server="$backup"
+    else
+        uci -q del podkop.settings.backup_dns_type
+        uci -q del podkop.settings.backup_dns_server
+    fi
+    uci commit podkop
+    patch_podkop_for_backup
+
+    # 3. Router WAN Dual DNS
+    uci -q del network.wan.dns
+    if [ -n "$wan1" ] && [ "$wan1" != "auto" ] && [ "$wan1" != "none" ]; then
+        uci -q add_list network.wan.dns="$wan1"
+    fi
+    if [ -n "$wan2" ] && [ "$wan2" != "auto" ] && [ "$wan2" != "none" ]; then
+        uci -q add_list network.wan.dns="$wan2"
+    fi
+    uci commit network
+
+    /etc/init.d/dnsmasq restart >/dev/null 2>&1
+    /etc/init.d/podkop restart >/dev/null 2>&1
+    sleep 2
+
+    if nslookup "$TEST_DOMAIN" 127.0.0.1 >/dev/null 2>&1 || ping -c 1 -W 2 "77.88.8.8" >/dev/null 2>&1; then
+        echo '{"status": "ok", "message": "Все настройки DNS успешно применены и проверены."}'
+    else
+        tar -xzf "$BACKUP_DIR/pre_apply_backup.tar.gz" -C / 2>/dev/null
+        /etc/init.d/dnsmasq restart >/dev/null 2>&1
+        /etc/init.d/podkop restart >/dev/null 2>&1
+        echo '{"status": "error", "message": "Сбой проверки сети. Автоматический откат назад."}'
+    fi
+}
+
+# ------------------------------------------------------------------------------
+# Entrypoint Router
+# ------------------------------------------------------------------------------
+case "$1" in
+    test)
+        action_test
+        ;;
+    status)
+        action_status
+        ;;
+    leak_test)
+        action_leak_test
+        ;;
+    check_update)
+        action_check_update
+        ;;
+    add_custom)
+        action_add_custom "$2" "$3" "$4" "$5" "$6" "$7"
+        ;;
+    del_custom)
+        action_del_custom "$2"
+        ;;
+    backup)
+        action_backup
+        ;;
+    restore)
+        action_restore
+        ;;
+    update)
+        action_update
+        ;;
+    apply_primary)
+        action_apply_primary "$2" "$3" "$4"
+        ;;
+    apply_backup)
+        action_apply_backup "$2" "$3"
+        ;;
+    apply_wan)
+        action_apply_wan "$2" "$3"
+        ;;
+    apply)
+        action_apply "$2" "$3" "$4" "$5" "$6" "$7" "$8"
+        ;;
+    *)
+        echo "Usage: $0 {test|status|leak_test|check_update|add_custom|del_custom|backup|restore|update|apply_primary|apply_backup|apply_wan|apply}"
+        exit 1
+        ;;
+esac
